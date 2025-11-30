@@ -30,9 +30,24 @@
 ## 実装フェーズと進捗
 - [x] **フェーズ1:** ERBlock単体実装と機能テスト
 - [x] **フェーズ2:** EfficientSRNet全体構造実装と形状テスト
-- [ ] フェーズ3: 損失関数とデータローダー設定
+- [x] フェーズ3: 損失関数とデータローダー設定
 - [ ] フェーズ4: 学習実行、速度・メモリベンチマーク
 - [ ] フェーズ5: 画質評価と結果比較
+
+### フェーズ3: 損失関数とデータローダー
+- **データローダー:** `SuperResolutionDataset` が HR/LR ペアを読み込み、LRが無い場合は HR からバイキュービックで生成します。ランダムクロップ、左右/上下フリップの軽量オーグメントをサポートし、`build_dataloaders` で訓練・検証ローダーを一括構築できます。
+- **損失:** `CompositeLoss` は L1、Charbonnier、Total Variation の重み付き合成をサポートします。`build_loss` から簡単に作成でき、個別の損失項も辞書で返してログに使えます。
+- **使用例:**
+```python
+from pathlib import Path
+from training_utils import DataloaderConfig, LossConfig, build_dataloaders, build_loss
+
+train_conf = DataloaderConfig(hr_dir=Path('data/train_HR'), lr_dir=Path('data/train_LR'), batch_size=8, scale=4)
+loaders = build_dataloaders(train_conf)
+
+loss_fn = build_loss(LossConfig(pixel_weight=1.0, charbonnier_weight=0.5, tv_weight=0.1))
+total_loss, components = loss_fn(sr_pred, hr_gt)
+```
 
 ## ローカルテスト
 ### 実装済みチェック項目
