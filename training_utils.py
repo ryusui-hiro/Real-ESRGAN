@@ -2,6 +2,10 @@
 from __future__ import annotations
 
 import random
+import shutil
+import time
+import urllib.request
+import zipfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -11,6 +15,9 @@ from PIL import Image
 import torch
 from torch import nn
 from torch.utils.data import DataLoader, Dataset
+
+
+DIV2K_BASE_URL = "https://data.vision.ee.ethz.ch/cvl/DIV2K/"
 
 
 def _load_image(path: Path) -> torch.Tensor:
@@ -31,6 +38,101 @@ def _random_crop(hr: torch.Tensor, patch_size: int) -> Tuple[torch.Tensor, Tuple
     return hr[:, top : top + patch_size, left : left + patch_size], (top, left)
 
 
+def _div2k_split_folders(split: str, subset: str, scale: int) -> Tuple[str, str, str, str]:
+    split_name = "train" if split == "train" else "valid"
+    hr_dirname = f"DIV2K_{split_name}_HR"
+    lr_dirname = f"DIV2K_{split_name}_LR_{subset}_X{scale}"
+    hr_zip = f"{hr_dirname}.zip"
+    lr_zip = f"DIV2K_{split_name}_LR_{subset}_X{scale}.zip"
+    return hr_dirname, lr_dirname, hr_zip, lr_zip
+
+
+def _download_file(url: str, dest: Path) -> None:
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    with urllib.request.urlopen(url) as response, dest.open("wb") as f:
+        shutil.copyfileobj(response, f)
+
+
+def _extract_zip(archive: Path, target_dir: Path) -> None:
+    with zipfile.ZipFile(archive, "r") as zip_ref:
+        zip_ref.extractall(target_dir)
+
+
+def _download_div2k_split(
+    root: Path,
+    split: str,
+    subset: str,
+    scale: int,
+    source: str,
+    hf_repo: str,
+) -> Tuple[Path, Path]:
+    hr_dirname, lr_dirname, hr_zip, lr_zip = _div2k_split_folders(split, subset, scale)
+    hr_dir = root / hr_dirname
+    lr_dir = root / lr_dirname
+
+    if hr_dir.exists() and lr_dir.exists():
+        return hr_dir, lr_dir
+
+    root.mkdir(parents=True, exist_ok=True)
+
+    if source == "huggingface":
+        try:
+            from huggingface_hub import hf_hub_download
+        except ImportError as exc:  # pragma: no cover - optional dependency path
+            raise ImportError(
+                "huggingface_hub is required for huggingface downloads. Install it or set download_source='official'."
+            ) from exc
+
+        hr_archive = Path(
+            hf_hub_download(
+                repo_id=hf_repo,
+                filename=hr_zip,
+                repo_type="dataset",
+            )
+        )
+        lr_archive = Path(
+            hf_hub_download(
+                repo_id=hf_repo,
+                filename=lr_zip,
+                repo_type="dataset",
+            )
+        )
+    else:
+        hr_archive = root / hr_zip
+        lr_archive = root / lr_zip
+        if not hr_archive.exists():
+            _download_file(DIV2K_BASE_URL + hr_zip, hr_archive)
+        if not lr_archive.exists():
+            _download_file(DIV2K_BASE_URL + lr_zip, lr_archive)
+
+    _extract_zip(hr_archive, root)
+    _extract_zip(lr_archive, root)
+    return hr_dir, lr_dir
+
+
+def prepare_div2k_folders(config: Div2KConfig, split: str = "train") -> Tuple[Path, Path]:
+    hr_dirname, lr_dirname, *_ = _div2k_split_folders(split, config.subset, config.scale)
+    hr_dir = config.root / hr_dirname
+    lr_dir = config.root / lr_dirname
+
+    if not hr_dir.exists() or not lr_dir.exists():
+        if not config.download:
+            raise FileNotFoundError(
+                f"DIV2K split '{split}' was not found under {config.root}. "
+                "Enable download=True to fetch it automatically."
+            )
+        hr_dir, lr_dir = _download_div2k_split(
+            root=config.root,
+            split=split,
+            subset=config.subset,
+            scale=config.scale,
+            source=config.download_source,
+            hf_repo=config.hf_repo,
+        )
+
+    return hr_dir, lr_dir
+
+
 @dataclass
 class DataloaderConfig:
     hr_dir: Path
@@ -41,6 +143,29 @@ class DataloaderConfig:
     patch_size: Optional[int] = 128
     augment: bool = True
     shuffle: bool = True
+
+
+@dataclass
+class Div2KConfig:
+    """Configuration for preparing DIV2K dataloaders.
+
+    Args:
+        root: Base directory where DIV2K will be stored/unpacked.
+        scale: Super-resolution scale factor (2, 3, or 4 in the official set).
+        subset: "bicubic" (default) or "mild"/"unknown" to pick alternative LR subsets.
+        download: Whether to attempt downloading the dataset if missing.
+        download_source: "official" to fetch from the ETHZ server or "huggingface" to
+            rely on a Hugging Face dataset mirror.
+        hf_repo: Hugging Face repo id to pull from when ``download_source`` is
+            ``"huggingface"``.
+    """
+
+    root: Path
+    scale: int = 4
+    subset: str = "bicubic"
+    download: bool = False
+    download_source: str = "official"
+    hf_repo: str = "eugenesiow/Div2k"
 
 
 class SuperResolutionDataset(Dataset[Tuple[torch.Tensor, torch.Tensor]]):
@@ -211,5 +336,192 @@ def build_dataloaders(train_config: DataloaderConfig, val_config: Optional[Datal
     return loaders
 
 
+def build_div2k_dataloaders(
+    config: Div2KConfig,
+    batch_size: int = 4,
+    num_workers: int = 0,
+    patch_size: Optional[int] = 128,
+    augment: bool = True,
+) -> Dict[str, DataLoader]:
+    """Create train/val dataloaders for DIV2K with optional auto-download.
+
+    This helper wraps :func:`prepare_div2k_folders` and feeds the resolved
+    HR/LR directories to :func:`build_dataloaders`, so callers can switch to
+    real DIV2K data by toggling a single flag.
+    """
+
+    train_hr, train_lr = prepare_div2k_folders(config, split="train")
+    val_hr, val_lr = prepare_div2k_folders(config, split="valid")
+
+    train_cfg = DataloaderConfig(
+        hr_dir=train_hr,
+        lr_dir=train_lr,
+        batch_size=batch_size,
+        num_workers=num_workers,
+        scale=config.scale,
+        patch_size=patch_size,
+        augment=augment,
+    )
+    val_cfg = DataloaderConfig(
+        hr_dir=val_hr,
+        lr_dir=val_lr,
+        batch_size=max(1, batch_size // 2),
+        num_workers=num_workers,
+        scale=config.scale,
+        patch_size=None,
+        augment=False,
+        shuffle=False,
+    )
+
+    return build_dataloaders(train_cfg, val_cfg)
+
+
 def build_loss(config: Optional[LossConfig] = None) -> CompositeLoss:
     return CompositeLoss(config or LossConfig())
+
+
+@dataclass
+class TrainingConfig:
+    epochs: int = 1
+    lr: float = 1e-4
+    device: Optional[str] = None
+    log_interval: int = 10
+    max_steps_per_epoch: Optional[int] = None
+    grad_clip: Optional[float] = None
+
+
+def train_one_epoch(
+    model: nn.Module,
+    dataloader: DataLoader,
+    criterion: CompositeLoss,
+    optimizer: torch.optim.Optimizer,
+    device: torch.device,
+    log_interval: int = 10,
+    max_steps: Optional[int] = None,
+) -> float:
+    model.train()
+    running_loss = 0.0
+    for step, (lr, hr) in enumerate(dataloader):
+        if max_steps is not None and step >= max_steps:
+            break
+        lr = lr.to(device)
+        hr = hr.to(device)
+
+        optimizer.zero_grad(set_to_none=True)
+        pred = model(lr)
+        loss, _ = criterion(pred, hr)
+        loss.backward()
+        optimizer.step()
+
+        running_loss += loss.item()
+        if (step + 1) % log_interval == 0:
+            avg_loss = running_loss / log_interval
+            print(f"[train] step {step+1}: loss={avg_loss:.4f}")
+            running_loss = 0.0
+
+    return running_loss
+
+
+def validate(
+    model: nn.Module,
+    dataloader: DataLoader,
+    criterion: CompositeLoss,
+    device: torch.device,
+    max_steps: Optional[int] = None,
+) -> float:
+    model.eval()
+    losses: List[float] = []
+    with torch.no_grad():
+        for step, (lr, hr) in enumerate(dataloader):
+            if max_steps is not None and step >= max_steps:
+                break
+            lr = lr.to(device)
+            hr = hr.to(device)
+            pred = model(lr)
+            loss, _ = criterion(pred, hr)
+            losses.append(loss.item())
+    return float(np.mean(losses)) if losses else 0.0
+
+
+def benchmark_throughput_and_memory(
+    model: nn.Module,
+    dataloader: DataLoader,
+    device: torch.device,
+    warmup: int = 2,
+    steps: int = 10,
+) -> Dict[str, float]:
+    """Return simple throughput/latency/memory measurements."""
+
+    timings: List[float] = []
+    memory: float = 0.0
+    iterator = iter(dataloader)
+    for idx in range(warmup + steps):
+        try:
+            lr, _ = next(iterator)
+        except StopIteration:
+            iterator = iter(dataloader)
+            lr, _ = next(iterator)
+
+        lr = lr.to(device)
+        torch.cuda.reset_peak_memory_stats(device) if device.type == "cuda" else None
+        start = time.perf_counter()
+        with torch.no_grad():
+            _ = model(lr)
+        torch.cuda.synchronize(device) if device.type == "cuda" else None
+        duration = time.perf_counter() - start
+
+        if idx >= warmup:
+            timings.append(duration)
+            if device.type == "cuda":
+                memory = max(memory, torch.cuda.max_memory_allocated(device) / (1024**2))
+    avg_ms = np.mean(timings) * 1000.0 if timings else 0.0
+    throughput = (len(dataloader.dataset) / avg_ms * 1000.0) if avg_ms > 0 else 0.0
+    return {
+        "latency_ms": avg_ms,
+        "throughput_items_per_s": throughput,
+        "max_mem_mb": memory,
+    }
+
+
+def run_training(
+    model: nn.Module,
+    loaders: Dict[str, DataLoader],
+    config: TrainingConfig,
+    loss_config: Optional[LossConfig] = None,
+) -> Dict[str, float]:
+    device = torch.device(config.device or ("cuda" if torch.cuda.is_available() else "cpu"))
+    model = model.to(device)
+    criterion = build_loss(loss_config)
+    optimizer = torch.optim.Adam(model.parameters(), lr=config.lr)
+
+    history: Dict[str, float] = {}
+    for epoch in range(config.epochs):
+        print(f"Epoch {epoch + 1}/{config.epochs}")
+        train_one_epoch(
+            model,
+            loaders["train"],
+            criterion,
+            optimizer,
+            device,
+            log_interval=config.log_interval,
+            max_steps=config.max_steps_per_epoch,
+        )
+        if "val" in loaders:
+            val_loss = validate(
+                model,
+                loaders["val"],
+                criterion,
+                device,
+                max_steps=config.max_steps_per_epoch,
+            )
+            history[f"val_loss_epoch_{epoch+1}"] = val_loss
+            print(f"[val] loss={val_loss:.4f}")
+
+    history.update(
+        benchmark_throughput_and_memory(
+            model,
+            loaders["train"],
+            device,
+        )
+    )
+    return history
