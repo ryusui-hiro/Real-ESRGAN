@@ -31,7 +31,7 @@
 - [x] **フェーズ1:** ERBlock単体実装と機能テスト
 - [x] **フェーズ2:** EfficientSRNet全体構造実装と形状テスト
 - [x] フェーズ3: 損失関数とデータローダー設定
-- [ ] フェーズ4: 学習実行、速度・メモリベンチマーク
+- [x] フェーズ4: 学習実行、速度・メモリベンチマーク
 - [ ] フェーズ5: 画質評価と結果比較
 
 ### フェーズ3: 損失関数とデータローダー
@@ -48,6 +48,41 @@ loaders = build_dataloaders(train_conf)
 loss_fn = build_loss(LossConfig(pixel_weight=1.0, charbonnier_weight=0.5, tv_weight=0.1))
 total_loss, components = loss_fn(sr_pred, hr_gt)
 ```
+
+### フェーズ4: 実データ学習とベンチマーク
+- **DIV2Kサポート:** `Div2KConfig` + `build_div2k_dataloaders` で公式サイトまたはHugging Faceミラーから自動ダウンロードし、HR/LRペアを構築します。
+- **学習CLI:** `efficient_sr_train.py` を使い、カスタム/Div2Kデータを指定して学習とベンチマークを1コマンドで実行できます。
+- **ベンチマーク:** `run_training` 内で推論レイテンシ、スループット、CUDAピークメモリを計測し、スモークテスト用途の `--max-steps` も用意しています。
+
+#### DIV2Kの例
+```bash
+# 公式サイトから自動ダウンロードして学習（train/validを自動で割り当て）
+python efficient_sr_train.py \
+  --dataset div2k \
+  --div2k-root data/DIV2K \
+  --div2k-download \
+  --batch-size 4 \
+  --epochs 1
+
+# 既存でダウンロード済みの場合（Hugging Faceミラーを明示指定することも可能）
+python efficient_sr_train.py --dataset div2k --div2k-root /mnt/datasets/DIV2K
+```
+
+#### カスタムデータの例
+```bash
+python efficient_sr_train.py \
+  --dataset custom \
+  --hr-dir data/train_HR \
+  --lr-dir data/train_LR \
+  --batch-size 8 \
+  --epochs 5
+```
+
+##### カスタムデータの配置先
+- ルートは任意ですが、例として `data/` 配下に以下のように置くとそのまま CLI が使えます。
+  - `data/train_HR/` : 高解像度画像（例: `0001.png`, `0002.png`）
+  - `data/train_LR/` : 低解像度画像（任意）。**ファイル名をHRと揃える**と自動でペアリングされます。LRが無い場合はHRからバイキュービックで生成します。
+- 検証データを分けたい場合は `--hr-dir` と `--lr-dir` を検証用パスに差し替えるか、`training_utils.build_dataloaders` に検証用の `DataloaderConfig` を渡します。
 
 ## ローカルテスト
 ### 実装済みチェック項目
